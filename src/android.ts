@@ -18,6 +18,8 @@ interface UiAutomatorXmlNode {
 	bounds?: string;
 	hint?: string;
 	focused?: string;
+	enabled?: string;
+	clickable?: string;
 	"content-desc"?: string;
 	"resource-id"?: string;
 }
@@ -321,11 +323,18 @@ export class AndroidRobot implements Robot {
 			}
 		}
 
-		if (node.text || node["content-desc"] || node.hint) {
+		const nodeText = node.text;
+		const nodeHint = node.hint;
+		const nodeClass = node.class || "";
+		const nodeEnabled = node.enabled === "true";
+		const nodeClickable = node.clickable === "true";
+		const nodeContentDesc = node["content-desc"];
+		const nodeResourceId = node["resource-id"] || null;
+		if (nodeText || nodeHint || nodeContentDesc || (nodeEnabled && nodeClickable && nodeResourceId !== null)) {
 			const element: ScreenElement = {
-				type: node.class || "text",
-				text: node.text,
-				label: node["content-desc"] || node.hint || "",
+				type: nodeClass || "text",
+				text: nodeText,
+				label: nodeContentDesc || nodeHint || "",
 				rect: this.getScreenElementRect(node),
 			};
 
@@ -334,9 +343,8 @@ export class AndroidRobot implements Robot {
 				element.focused = true;
 			}
 
-			const resourceId = node["resource-id"];
-			if (resourceId !== null && resourceId !== "") {
-				element.identifier = resourceId;
+			if (nodeResourceId !== null) {
+				element.identifier = nodeResourceId;
 			}
 
 			if (element.rect.width > 0 && element.rect.height > 0) {
