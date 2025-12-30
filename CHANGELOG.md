@@ -1,3 +1,17 @@
+## [0.0.38](https://github.com/mobile-next/mobile-mcp/releases/tag/0.0.38) (2025-12-09)
+
+* iOS: migrated iPhone Simulator calls to use mobilecli binary for improved performance ([#241](https://github.com/mobile-next/mobile-mcp/pull/241))
+* iOS: automatically downloading and installing Webdriver Agent on simulator, get started in iOS development in seconds ([#241](https://github.com/mobile-next/mobile-mcp/pull/241))
+
+## [0.0.37](https://github.com/mobile-next/mobile-mcp/releases/tag/0.0.37) (2025-12-08)
+
+* Server: migrated to new mcp sdk tool registration API ([#239](https://github.com/mobile-next/mobile-mcp/pull/239))
+* Server: updated to @modelcontextprotocol/sdk 1.24.2 and other dependencies for security ([#239](https://github.com/mobile-next/mobile-mcp/pull/239))
+
+## [0.0.36](https://github.com/mobile-next/mobile-mcp/releases/tag/0.0.36) (2025-11-19)
+
+* Server: upgraded libraries (glob, js-yaml) and mobilecli ([#234](https://github.com/mobile-next/mobile-mcp/pull/234))
+
 ## [0.0.35](https://github.com/mobile-next/mobile-mcp/releases/tag/0.0.35) (2025-11-14)
 
 * Server: added list of available MCP tools to README for better discoverability ([043cf3d](https://github.com/mobile-next/mobile-mcp/commit/043cf3d))

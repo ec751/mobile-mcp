@@ -1,31 +1,29 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types";
-import { z, ZodRawShape, ZodTypeAny } from "zod";
+import { z } from "zod";
 import fs from "node:fs";
 import os from "node:os";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 
 import { error, trace } from "./logger";
 import { AndroidRobot, AndroidDeviceManager } from "./android";
 import { ActionableError, Robot } from "./robot";
-import { SimctlManager } from "./iphone-simulator";
 import { IosManager, IosRobot } from "./ios";
 import { PNG } from "./png";
 import { isScalingAvailable, Image } from "./image-utils";
-import { getMobilecliPath } from "./mobilecli";
+import { Mobilecli } from "./mobilecli";
+import { MobileDevice } from "./mobile-device";
+
+interface MobilecliDevice {
+	id: string;
+	name: string;
+	platform: "android" | "ios";
+	type: "real" | "emulator" | "simulator";
+	version: string;
+	state: "online" | "offline";
+}
 
 interface MobilecliDevicesResponse {
-	status: "ok";
-	data: {
-		devices: Array<{
-			id: string;
-			name: string;
-			platform: "android" | "ios";
-			type: "real" | "emulator" | "simulator";
-			version: string;
-		}>;
-	};
+	devices: MobilecliDevice[];
 }
 
 export const getAgentVersion = (): string => {
@@ -38,10 +36,6 @@ export const createMcpServer = (): McpServer => {
 	const server = new McpServer({
 		name: "mobile-mcp",
 		version: getAgentVersion(),
-		capabilities: {
-			resources: {},
-			tools: {},
-		},
 	});
 
 	// an empty object to satisfy windsurf
@@ -57,13 +51,21 @@ export const createMcpServer = (): McpServer => {
 		}
 	};
 
-	const tool = (name: string, description: string, paramsSchema: ZodRawShape, cb: (args: z.objectOutputType<ZodRawShape, ZodTypeAny>) => Promise<string>) => {
-		const wrappedCb = async (args: ZodRawShape): Promise<CallToolResult> => {
+	type ZodSchemaShape = Record<string, z.ZodType>;
+
+	const tool = (name: string, title: string, description: string, paramsSchema: ZodSchemaShape, cb: (args: any) => Promise<string>) => {
+		server.registerTool(name, {
+			title,
+			description,
+			inputSchema: paramsSchema,
+		}, (async (args: any, _extra: any) => {
 			try {
 				trace(`Invoking ${name} with args: ${JSON.stringify(args)}`);
+				const start = +new Date();
 				const response = await cb(args);
+				const duration = +new Date() - start;
 				trace(`=> ${response}`);
-				posthog("tool_invoked", { "ToolName": name }).then();
+				posthog("tool_invoked", { "ToolName": name, "Duration": duration }).then();
 				return {
 					content: [{ type: "text", text: response }],
 				};
@@ -82,9 +84,7 @@ export const createMcpServer = (): McpServer => {
 					};
 				}
 			}
-		};
-
-		server.tool(name, description, paramsSchema, args => wrappedCb(args));
+		}) as any);
 	};
 
 	const posthog = async (event: string, properties: Record<string, string | number>) => {
@@ -125,130 +125,133 @@ export const createMcpServer = (): McpServer => {
 		}
 	};
 
-	const getMobilecliVersion = (): string => {
-		try {
-			const path = getMobilecliPath();
-			const output = execFileSync(path, ["--version"], { encoding: "utf8" }).toString().trim();
-			if (output.startsWith("mobilecli version ")) {
-				return output.substring("mobilecli version ".length);
-			}
+	const mobilecli = new Mobilecli();
+	posthog("launch", {}).then();
 
-			return "failed";
+	const ensureMobilecliAvailable = (): void => {
+		try {
+			const version = mobilecli.getVersion();
+			if (version.startsWith("failed")) {
+				throw new Error("mobilecli version check failed");
+			}
 		} catch (error: any) {
-			return "failed " + error.message;
+			throw new ActionableError(`mobilecli is not available or not working properly. Please review the documentation at https://github.com/mobile-next/mobile-mcp/wiki for installation instructions`);
 		}
 	};
 
-	const getMobilecliDevices = (): MobilecliDevicesResponse => {
-		const mobilecliPath = getMobilecliPath();
-		const mobilecliOutput = execFileSync(mobilecliPath, ["devices"], { encoding: "utf8" }).toString().trim();
-		return JSON.parse(mobilecliOutput) as MobilecliDevicesResponse;
-	};
+	const getRobotFromDevice = (deviceId: string): Robot => {
 
-	const mobilecliVersion = getMobilecliVersion();
-	posthog("launch", { "MobilecliVersion": mobilecliVersion }).then();
+		// from now on, we must have mobilecli working
+		ensureMobilecliAvailable();
 
-	const simulatorManager = new SimctlManager();
-
-	const getRobotFromDevice = (device: string): Robot => {
+		// Check if it's an iOS device
 		const iosManager = new IosManager();
-		const androidManager = new AndroidDeviceManager();
-		const simulators = simulatorManager.listBootedSimulators();
-		const androidDevices = androidManager.getConnectedDevices();
 		const iosDevices = iosManager.listDevices();
-
-		// Check if it's a simulator
-		const simulator = simulators.find(s => s.name === device);
-		if (simulator) {
-			return simulatorManager.getSimulator(device);
+		const iosDevice = iosDevices.find(d => d.deviceId === deviceId);
+		if (iosDevice) {
+			return new IosRobot(deviceId);
 		}
 
 		// Check if it's an Android device
-		const androidDevice = androidDevices.find(d => d.deviceId === device);
+		const androidManager = new AndroidDeviceManager();
+		const androidDevices = androidManager.getConnectedDevices();
+		const androidDevice = androidDevices.find(d => d.deviceId === deviceId);
 		if (androidDevice) {
-			return new AndroidRobot(device);
+			return new AndroidRobot(deviceId);
 		}
 
-		// Check if it's an iOS device
-		const iosDevice = iosDevices.find(d => d.deviceId === device);
-		if (iosDevice) {
-			return new IosRobot(device);
+		// Check if it's a simulator (will later replace all other device types as well)
+		const response = mobilecli.getDevices({
+			platform: "ios",
+			type: "simulator",
+			includeOffline: false,
+		});
+
+		if (response.status === "ok" && response.data && response.data.devices) {
+			for (const device of response.data.devices) {
+				if (device.id === deviceId) {
+					return new MobileDevice(deviceId);
+				}
+			}
 		}
 
-		throw new ActionableError(`Device "${device}" not found. Use the mobile_list_available_devices tool to see available devices.`);
+		throw new ActionableError(`Device "${deviceId}" not found. Use the mobile_list_available_devices tool to see available devices.`);
 	};
 
 	tool(
 		"mobile_list_available_devices",
+		"List Devices",
 		"List all available devices. This includes both physical devices and simulators. If there is more than one device returned, you need to let the user select one of them.",
 		{
 			noParams
 		},
 		async ({}) => {
+
+			// from today onward, we must have mobilecli working
+			ensureMobilecliAvailable();
+
 			const iosManager = new IosManager();
 			const androidManager = new AndroidDeviceManager();
-			const simulators = simulatorManager.listBootedSimulators();
-			const simulatorNames = simulators.map(d => d.name);
-			const androidDevices = androidManager.getConnectedDevices();
-			const iosDevices = await iosManager.listDevices();
-			const iosDeviceNames = iosDevices.map(d => d.deviceId);
-			const androidTvDevices = androidDevices.filter(d => d.deviceType === "tv").map(d => d.deviceId);
-			const androidMobileDevices = androidDevices.filter(d => d.deviceType === "mobile").map(d => d.deviceId);
+			const devices: MobilecliDevice[] = [];
 
-			if (true) {
-				// gilm: this is new code to verify first that mobilecli detects more or equal number of devices.
-				// in an attempt to make the smoothest transition from go-ios+xcrun+adb+iproxy+sips+imagemagick+wda to
-				// a single cli tool.
-				const deviceCount = simulators.length + iosDevices.length + androidDevices.length;
+			// Get Android devices with details
+			const androidDevices = androidManager.getConnectedDevicesWithDetails();
+			for (const device of androidDevices) {
+				devices.push({
+					id: device.deviceId,
+					name: device.name,
+					platform: "android",
+					type: "emulator",
+					version: device.version,
+					state: "online",
+				});
+			}
 
-				let mobilecliDeviceCount = 0;
-				try {
-					const response = getMobilecliDevices();
-					if (response.status === "ok" && response.data && response.data.devices) {
-						mobilecliDeviceCount = response.data.devices.length;
-					}
-				} catch (error: any) {
-					// if mobilecli fails, we'll just set count to 0
+			// Get iOS physical devices with details
+			try {
+				const iosDevices = iosManager.listDevicesWithDetails();
+				for (const device of iosDevices) {
+					devices.push({
+						id: device.deviceId,
+						name: device.deviceName,
+						platform: "ios",
+						type: "real",
+						version: device.version,
+						state: "online",
+					});
 				}
+			} catch (error: any) {
+				// If go-ios is not available, silently skip
+			}
 
-				if (deviceCount === mobilecliDeviceCount) {
-					posthog("debug_mobilecli_same_number_of_devices", {
-						"DeviceCount": deviceCount,
-						"MobilecliDeviceCount": mobilecliDeviceCount,
-					}).then();
-				} else {
-					posthog("debug_mobilecli_different_number_of_devices", {
-						"DeviceCount": deviceCount,
-						"MobilecliDeviceCount": mobilecliDeviceCount,
-						"DeviceCountDifference": deviceCount - mobilecliDeviceCount,
-					}).then();
+			// Get iOS simulators from mobilecli (excluding offline devices)
+			const response = mobilecli.getDevices({
+				platform: "ios",
+				type: "simulator",
+				includeOffline: false,
+			});
+			if (response.status === "ok" && response.data && response.data.devices) {
+				for (const device of response.data.devices) {
+					devices.push({
+						id: device.id,
+						name: device.name,
+						platform: device.platform,
+						type: device.type,
+						version: device.version,
+						state: "online",
+					});
 				}
 			}
 
-			const resp = ["Found these devices:"];
-			if (simulatorNames.length > 0) {
-				resp.push(`iOS simulators: [${simulatorNames.join(",")}]`);
-			}
-
-			if (iosDevices.length > 0) {
-				resp.push(`iOS devices: [${iosDeviceNames.join(",")}]`);
-			}
-
-			if (androidMobileDevices.length > 0) {
-				resp.push(`Android devices: [${androidMobileDevices.join(",")}]`);
-			}
-
-			if (androidTvDevices.length > 0) {
-				resp.push(`Android TV devices: [${androidTvDevices.join(",")}]`);
-			}
-
-			return resp.join("\n");
+			const out: MobilecliDevicesResponse = { devices };
+			return JSON.stringify(out);
 		}
 	);
 
 
 	tool(
 		"mobile_list_apps",
+		"List Apps",
 		"List all the installed apps on the device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
@@ -262,6 +265,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_launch_app",
+		"Launch App",
 		"Launch an app on mobile device. Use this to open a specific app. You can find the package name of the app by calling list_apps_on_device.",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -276,6 +280,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_terminate_app",
+		"Terminate App",
 		"Stop and terminate an app on mobile device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -290,6 +295,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_install_app",
+		"Install App",
 		"Install an app on mobile device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -304,6 +310,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_uninstall_app",
+		"Uninstall App",
 		"Uninstall an app from mobile device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -318,6 +325,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_get_screen_size",
+		"Get Screen Size",
 		"Get the screen size of the mobile device in pixels",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
@@ -331,6 +339,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_click_on_screen_at_coordinates",
+		"Click Screen",
 		"Click on the screen at given x,y coordinates. If clicking on an element, use the list_elements_on_screen tool to find the coordinates.",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -346,6 +355,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_double_tap_on_screen",
+		"Double Tap Screen",
 		"Double-tap on the screen at given x,y coordinates.",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -361,6 +371,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_long_press_on_screen_at_coordinates",
+		"Long Press Screen",
 		"Long press on the screen at given x,y coordinates. If long pressing on an element, use the list_elements_on_screen tool to find the coordinates.",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -376,6 +387,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_list_elements_on_screen",
+		"List Screen Elements",
 		"List elements on screen and their coordinates, with display text or accessibility label. Do not cache this result.",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
@@ -413,6 +425,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_press_button",
+		"Press Button",
 		"Press a button on device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -427,6 +440,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_open_url",
+		"Open URL",
 		"Open a URL in browser on device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -441,6 +455,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_swipe_on_screen",
+		"Swipe Screen",
 		"Swipe on the screen",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -467,6 +482,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_type_keys",
+		"Type Text",
 		"Type text into the focused element",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -487,6 +503,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_save_screenshot",
+		"Save Screenshot",
 		"Save a screenshot of the mobile device to a file",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -501,11 +518,14 @@ export const createMcpServer = (): McpServer => {
 		}
 	);
 
-	server.tool(
+	server.registerTool(
 		"mobile_take_screenshot",
-		"Take a screenshot of the mobile device. Use this to understand what's on screen, if you need to press an element that is available through view hierarchy then you must list elements on screen instead. Do not cache this result.",
 		{
-			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
+			title: "Take Screenshot",
+			description: "Take a screenshot of the mobile device. Use this to understand what's on screen, if you need to press an element that is available through view hierarchy then you must list elements on screen instead. Do not cache this result.",
+			inputSchema: {
+				device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
+			}
 		},
 		async ({ device }) => {
 			try {
@@ -561,6 +581,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_set_orientation",
+		"Set Orientation",
 		"Change the screen orientation of the device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you."),
@@ -575,6 +596,7 @@ export const createMcpServer = (): McpServer => {
 
 	tool(
 		"mobile_get_orientation",
+		"Get Orientation",
 		"Get the current screen orientation of the device",
 		{
 			device: z.string().describe("The device identifier to use. Use mobile_list_available_devices to find which devices are available to you.")
